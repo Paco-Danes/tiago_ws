@@ -1,0 +1,2 @@
+tiago_primitives
+-DCATKIN_DEVEL_PREFIX=/home/user/exchange/tiago_ws/devel -DCMAKE_INSTALL_PREFIX=/home/user/exchange/tiago_ws/install -G Unix Makefiles

@@ -1,0 +1,11 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/user/exchange/tiago_ws/build/cmake_install.cmake",
+		"/home/user/exchange/tiago_ws/build/gtest/cmake_install.cmake",
+		"/home/user/exchange/tiago_ws/build/gtest/googlemock/cmake_install.cmake",
+		"/home/user/exchange/tiago_ws/build/gtest/googletest/cmake_install.cmake",
+		"/home/user/exchange/tiago_ws/build/tiago_primitives/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

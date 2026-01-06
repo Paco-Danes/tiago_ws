@@ -1,0 +1,8 @@
+prefix=/home/user/exchange/tiago_ws/devel
+
+Name: tiago_primitives
+Description: Description of tiago_primitives
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 
