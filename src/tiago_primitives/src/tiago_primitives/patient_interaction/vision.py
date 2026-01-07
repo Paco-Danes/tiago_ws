@@ -69,10 +69,9 @@ def simulate_face_recognition(patient_name: str, hold_seconds: float, cam_index:
     cv2.destroyWindow(win)
     return recognized
 
-# --- Gazebo approach using RGB color segmentation + depth distance -------------
 import time
 import threading
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import cv2
 import numpy as np
@@ -83,13 +82,57 @@ from cv_bridge import CvBridge
 from .speech import tiago_say
 from .base_motion import publish_cmd_vel
 
+from ultralytics import YOLO
+import numpy as np
+
+class YoloV8PersonDetector:
+    def __init__(self, conf=0.3):
+        self.model = YOLO("yolov8n.pt")
+        self.conf = conf
+
+    def detect(self, bgr_img):
+        """
+        bgr_img: numpy array (H,W,3) BGR
+        returns: (x,y,w,h,conf) or None
+        """
+        # Ultralytics expects RGB
+        rgb = bgr_img[:, :, ::-1]
+
+        results = self.model(
+            rgb,
+            device="cpu",
+            conf=self.conf,
+            verbose=False
+        )
+
+        r = results[0]
+        if r.boxes is None:
+            return None
+
+        boxes = r.boxes
+        cls = boxes.cls.cpu().numpy()
+        confs = boxes.conf.cpu().numpy()
+        xyxy = boxes.xyxy.cpu().numpy()
+
+        # COCO: class 0 = person
+        person_idxs = np.where(cls == 0)[0]
+        if len(person_idxs) == 0:
+            return None
+
+        # pick highest confidence person
+        i = person_idxs[np.argmax(confs[person_idxs])]
+        x1, y1, x2, y2 = xyxy[i]
+
+        x, y = int(x1), int(y1)
+        w, h = int(x2 - x1), int(y2 - y1)
+        return x, y, w, h, float(confs[i])
 
 class GazeboRGBDListener:
     def __init__(self, rgb_topic: str, depth_topic: str):
         self.bridge = CvBridge()
         self.lock = threading.Lock()
-        self.last_rgb_bgr = None      # np.ndarray HxWx3 uint8
-        self.last_depth_m = None      # np.ndarray HxW float32 meters
+        self.last_rgb_bgr = None
+        self.last_depth_m = None
 
         self.rgb_sub = rospy.Subscriber(rgb_topic, Image, self._on_rgb, queue_size=1)
         self.depth_sub = rospy.Subscriber(depth_topic, Image, self._on_depth, queue_size=1)
@@ -100,7 +143,7 @@ class GazeboRGBDListener:
             self.last_rgb_bgr = bgr
 
     def _on_depth(self, msg: Image):
-        # Gazebo often publishes 32FC1 (meters). Some setups publish 16UC1 (mm).
+        # depth_registered is usually 32FC1 meters; sometimes 16UC1 mm
         if msg.encoding in ("32FC1", "32FC"):
             d = self.bridge.imgmsg_to_cv2(msg, desired_encoding="32FC1").astype(np.float32)
             depth_m = d
@@ -137,93 +180,29 @@ class GazeboRGBDListener:
         return rgb, depth
 
 
-def _hsv_mask_for_person(hsv: np.ndarray) -> np.ndarray:
-    """
-    Tuned for Gazebo human:
-    - Strong blue jeans
-    - Dark / low-sat shirt (red-brown-green plaid)
-    """
-    H, S, V = cv2.split(hsv)
+def letterbox(im: np.ndarray, new_shape: int = 640, color=(114, 114, 114)):
+    """Resize with padding to square (YOLO style). Returns resized image + scale + pad."""
+    h, w = im.shape[:2]
+    scale = min(new_shape / h, new_shape / w)
+    nh, nw = int(round(h * scale)), int(round(w * scale))
+    im_resized = cv2.resize(im, (nw, nh), interpolation=cv2.INTER_LINEAR)
 
-    # --- Blue jeans
-    jeans = cv2.inRange(hsv, (80, 25, 15), (150, 255, 255))
+    pad_w = new_shape - nw
+    pad_h = new_shape - nh
+    top = pad_h // 2
+    bottom = pad_h - top
+    left = pad_w // 2
+    right = pad_w - left
 
-    # Combine: jeans
-    mask = jeans
+    im_padded = cv2.copyMakeBorder(im_resized, top, bottom, left, right,
+                                   cv2.BORDER_CONSTANT, value=color)
+    return im_padded, scale, left, top
 
-    # Morphology cleanup
-    kernel = np.ones((5, 5), np.uint8)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-
-    return mask
-
-
-def detect_person_blob_rgb(
-    bgr: np.ndarray,
-    min_area_px: int = 1500,
-    min_aspect: float = 1.3,    # tall-ish
-    min_height_frac: float = 0.20,
-) -> Optional[Tuple[int, int, int, int]]:
-    """
-    Returns bounding box (x, y, w, h) of best person candidate, or None.
-    """
-    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
-    mask = _hsv_mask_for_person(hsv)
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return None
-
-    H, W = bgr.shape[:2]
-
-    best = None
-    best_score = -1.0
-    for cnt in contours:
-        area = float(cv2.contourArea(cnt))
-        if area < float(min_area_px):
-            continue
-
-        x, y, w, h = cv2.boundingRect(cnt)
-        
-        # jeans lower half check
-        roi = hsv[y + h//2 : y + h, x : x + w]
-        if roi.size == 0:
-            continue
-
-        jeans_roi = cv2.inRange(roi, (80, 25, 15), (150, 255, 255))
-        if cv2.countNonZero(jeans_roi) < 0.10 * roi.shape[0] * roi.shape[1]:
-            continue
-
-        # Expand bbox upward: torso is above jeans
-        y2 = max(0, y - int(1.1 * h))     # extend up by ~1.1x jeans height
-        h2 = h + y - y2                 # keep bottom fixed
-        x2 = max(0, x - int(0.35 * w))    # widen a bit
-        w2 = min(W - x2, int(1.7 * w))
-
-        x, y, w, h = x2, y2, w2, h2
-        # Basic shape filters
-        if h < int(min_height_frac * H):
-            continue
-        aspect = float(h) / max(1.0, float(w))
-        if aspect < float(min_aspect):
-            continue
-
-        # Score: prefer larger and more centered blobs
-        cx = x + w / 2.0
-        center_score = 1.0 - abs(cx - (W / 2.0)) / (W / 2.0)
-        score = area * 0.7 + (center_score * 1000.0) + (h * 2.0)
-
-        if score > best_score:
-            best_score = score
-            best = (x, y, w, h)
-
-    return best
-
-
-def depth_at_bbox(depth_m: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[float]:
-    x, y, w, h = bbox
+def depth_at_bbox(depth_m: np.ndarray, bbox_xywh: Tuple[int, int, int, int]) -> Optional[float]:
+    x, y, w, h = bbox_xywh
     H, W = depth_m.shape[:2]
+
+    # sample a central region (more stable than edges)
     x0 = max(0, x + int(0.35 * w))
     x1 = min(W, x + int(0.65 * w))
     y0 = max(0, y + int(0.30 * h))
@@ -236,46 +215,47 @@ def depth_at_bbox(depth_m: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optio
     return float(np.median(vals))
 
 
-def scan_center_and_approach_person_rgb(
+def scan_center_and_approach_person_yolo(
     pub,
     rgb_topic: str,
     depth_topic: str,
     scan_wz: float = 0.30,
     scan_step_s: float = 0.35,
     max_scan_steps: int = 160,
-    center_tol_px: int = 40,
+    center_tol_px: int = 35,
     center_kp: float = 0.9,
     center_max_wz: float = 0.6,
     linear_speed: float = 0.35,
     approach_fraction: float = 0.80,
     debug_view: bool = False,
 ) -> Optional[float]:
-    """
-    Rotate, detect person by RGB color segmentation, center it, then drive forward 80% of depth distance.
-    Returns initial distance (m) or None.
-    """
+
     listener = GazeboRGBDListener(rgb_topic, depth_topic)
     if not listener.wait(timeout_s=6.0):
-        rospy.logwarn("No RGB/Depth frames. Check topics: %s and %s", rgb_topic, depth_topic)
+        rospy.logwarn("No RGB/Depth frames. Check topics: %s %s", rgb_topic, depth_topic)
         return None
+
+    det = YoloV8PersonDetector(conf=rospy.get_param("~yolo_conf_thres", 0.3))
+
 
     tiago_say("Scanning for a person.")
 
     bbox = None
     dist0 = None
 
-    # --- Scan phase
+    # --- Scan
     for _ in range(int(max_scan_steps)):
         if rospy.is_shutdown():
             return None
 
         bgr, depth = listener.get()
         if bgr is not None and depth is not None:
-            bb = detect_person_blob_rgb(bgr)
-            if bb is not None:
-                d = depth_at_bbox(depth, bb)
+            res = det.detect(bgr)
+            if res is not None:
+                x, y, w, h, conf = res
+                d = depth_at_bbox(depth, (x, y, w, h))
                 if d is not None:
-                    bbox = bb
+                    bbox = (x, y, w, h, conf)
                     dist0 = d
                     break
 
@@ -287,7 +267,7 @@ def scan_center_and_approach_person_rgb(
 
     tiago_say("Person found. Centering.")
 
-    # --- Center phase
+    # --- Center
     for _ in range(120):
         if rospy.is_shutdown():
             return None
@@ -297,18 +277,17 @@ def scan_center_and_approach_person_rgb(
             rospy.sleep(0.05)
             continue
 
-        bb = detect_person_blob_rgb(bgr)
-        if bb is None:
-            # Lost: small scan nudge
+        res = det.detect(bgr)
+        if res is None:
             publish_cmd_vel(pub, 0.0, scan_wz, 0.2, rate_hz=20)
             continue
 
-        d = depth_at_bbox(depth, bb)
+        x, y, w, h, conf = res
+        d = depth_at_bbox(depth, (x, y, w, h))
         if d is None:
             publish_cmd_vel(pub, 0.0, scan_wz, 0.2, rate_hz=20)
             continue
 
-        x, y, w, h = bb
         H, W = bgr.shape[:2]
         cx = x + w // 2
         err = cx - (W // 2)
@@ -316,23 +295,22 @@ def scan_center_and_approach_person_rgb(
         if debug_view:
             vis = bgr.copy()
             cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            cv2.circle(vis, (cx, y + h // 2), 6, (0, 255, 0), -1)
-            cv2.putText(vis, f"err={err}px  d={d:.2f}m", (20, 40),
+            cv2.putText(vis, f"person conf={conf:.2f} d={d:.2f}m err={err}px", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
-            cv2.imshow("Gazebo Person Detection", vis)
+            cv2.imshow("Gazebo YOLO Person Detection", vis)
             cv2.waitKey(1)
 
         if abs(err) <= int(center_tol_px):
-            dist0 = d  # update distance right before approach
+            dist0 = d
             break
 
-        # +wz is CCW (left). If blob is right (err>0), we need turn right => negative wz.
+        # err>0 => person right => turn right => negative wz
         wz = -center_kp * (float(err) / float(W // 2))
         wz = max(-center_max_wz, min(center_max_wz, wz))
         publish_cmd_vel(pub, 0.0, wz, 0.18, rate_hz=20)
 
     if debug_view:
-        cv2.destroyWindow("Gazebo Person Detection")
+        cv2.destroyWindow("Gazebo YOLO Person Detection")
 
     tiago_say("Approaching.")
 
@@ -344,5 +322,6 @@ def scan_center_and_approach_person_rgb(
 
     dur = travel / max(0.05, float(linear_speed))
     publish_cmd_vel(pub, float(linear_speed), 0.0, float(dur), rate_hz=20)
+
     tiago_say("I have arrived.")
     return dist0
