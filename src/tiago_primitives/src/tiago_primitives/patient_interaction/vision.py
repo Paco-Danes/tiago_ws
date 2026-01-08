@@ -3,87 +3,146 @@ import rospy
 from .speech import tiago_say
 from .base_motion import publish_cmd_vel
 import cv2
+import os
 import numpy as np
 
-def simulate_face_recognition(patient_name: str, hold_seconds: float, cam_index: int) -> bool:
-    tiago_say("Hello there! Please look at me!")
+# --- CONFIGURATION ---
+MODEL_FILE = "/home/user/exchange/tiago_ws/data/face_trainer.yml" # Ensure this path is correct relative to where you run rosrun
+RECOGNITION_THRESHOLD = 70      # Lower = Stricter. Adjust based on light conditions.
 
+# Map ID to Name
+ID_TO_NAME = {
+    1: "patient",
+    2: "supervisor"
+}
+
+def get_lbph_recognizer():
+    """Loads the trained model."""
+    if not os.path.exists(MODEL_FILE):
+        rospy.logerr(f"LBPH Model file '{MODEL_FILE}' not found! Run capture_training_faces.py first.")
+        return None
+    
+    try:
+        recognizer = cv2.face.LBPHFaceRecognizer_create()
+        recognizer.read(MODEL_FILE)
+        return recognizer
+    except Exception as e:
+        rospy.logerr(f"Failed to load LBPH model: {e}")
+        return None
+
+def recognize_person(hold_seconds: float = 2.0, cam_index: int = 0) -> str:
+    """
+    Scans the camera feed until a face is recognized.
+    Returns: "patient" or "supervisor" (as a string).
+    """
+    tiago_say("I am scanning for a face. Please look at me.")
+
+    # 1. Load Model
+    recognizer = get_lbph_recognizer()
+    if recognizer is None:
+        tiago_say("My vision system is not trained.")
+        return "unknown"
+
+    # 2. Open Camera
     cap = cv2.VideoCapture(cam_index)
     if not cap.isOpened():
-        rospy.logwarn("Cannot open camera index %d. Simulating with a blank window.", cam_index)
-        cap = None
+        rospy.logwarn("Cannot open camera index %d.", cam_index)
+        return "error"
 
-    win = "CareTIAGO Face Check"
-    try:
-        cv2.namedWindow(win, cv2.WINDOW_NORMAL)
-    except Exception as e:
-        rospy.logwarn("Cannot create OpenCV window (%s). Simulating recognition with a sleep.", e)
-        time.sleep(hold_seconds)
-        return True
+    win = "CareTIAGO Identity Scanner"
+    cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
-    start_wall = time.time()
-    recognized = False
-    blank = None
+    # Recognition State
+    current_candidate = None
+    start_hold_time = None
+    final_identity = None
 
-    while True:
-        elapsed = time.time() - start_wall
+    while not rospy.is_shutdown():
+        ret, frame = cap.read()
+        if not ret: 
+            break
 
-        frame = None
-        if cap is not None:
-            ret, frame = cap.read()
-            if not ret:
-                frame = None
-
-        if frame is None:
-            if blank is None:
-                blank = np.zeros((480, 640, 3), dtype=np.uint8)
-            frame = blank.copy()
-
+        # Standard Overlay
         h, w = frame.shape[:2]
         center = (w // 2, h // 2)
         axes = (int(w * 0.18), int(h * 0.28))
+        
+        # --- PREPROCESSING (Crop -> Gray) ---
+        x = max(0, center[0] - axes[0])
+        y = max(0, center[1] - axes[1])
+        rw = min(w - x, axes[0] * 2)
+        rh = min(h - y, axes[1] * 2)
+        
+        roi = frame[y:y+rh, x:x+rw]
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
 
-        color = (0, 0, 255)
-        text = "Align face inside oval"
-        if elapsed >= hold_seconds:
-            color = (0, 255, 0)
-            text = f"Recognized: {patient_name}"
-            recognized = True
+        # --- INFERENCE ---
+        try:
+            label, conf = recognizer.predict(gray)
+            
+            # Identify Candidate
+            if conf < RECOGNITION_THRESHOLD:
+                detected_name = ID_TO_NAME.get(label, "Unknown")
+                debug_color = (0, 255, 0) # Green for known
+            else:
+                detected_name = "Unknown"
+                debug_color = (0, 0, 255) # Red for unknown
+                
+        except Exception:
+            detected_name = "Error"
+            conf = 100
+            debug_color = (0, 0, 255)
 
-        cv2.ellipse(frame, center, axes, 0, 0, 360, color, 3)
-        cv2.putText(frame, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2, cv2.LINE_AA)
-        cv2.putText(frame, "Press 'q' to cancel", (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2, cv2.LINE_AA)
+        # --- STABILITY LOGIC ---
+        # We only start the timer if we see a KNOWN person (patient or supervisor)
+        if detected_name in ["patient", "supervisor"]:
+            
+            # If the person changed (e.g. from Patient to Supervisor), reset timer
+            if detected_name != current_candidate:
+                current_candidate = detected_name
+                start_hold_time = time.time()
+            
+            # Calculate elapsed time
+            elapsed = time.time() - start_hold_time
+            
+            status_text = f"Identifying: {current_candidate.upper()} ({elapsed:.1f}s)"
+            
+            if elapsed >= hold_seconds:
+                final_identity = current_candidate
+                tiago_say(f"Hello, {final_identity}.")
+                break
+        else:
+            # Reset if face is unknown or lost
+            current_candidate = None
+            start_hold_time = None
+            status_text = "Scanning... (Unknown Face)"
+
+        # --- DRAWING ---
+        cv2.ellipse(frame, center, axes, 0, 0, 360, debug_color, 3)
+        cv2.putText(frame, status_text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, debug_color, 2)
+        cv2.putText(frame, f"Debug: {detected_name} (Conf: {int(conf)})", (20, h - 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
 
         cv2.imshow(win, frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            recognized = False
+        
+        # Quit option
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            rospy.loginfo("Recognition cancelled by user.")
+            final_identity = "cancelled"
             break
 
-        if recognized:
-            cv2.waitKey(600)
-            break
+    cap.release()
+    cv2.destroyAllWindows()
+    
+    return final_identity
 
-    if cap is not None:
-        cap.release()
-    cv2.destroyWindow(win)
-    return recognized
-
-import time
 import threading
 from typing import Optional, Tuple, List
-
-import cv2
-import numpy as np
-import rospy
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
-
 from .speech import tiago_say
 from .base_motion import publish_cmd_vel
-
 from ultralytics import YOLO
-import numpy as np
+
 
 class YoloV8PersonDetector:
     def __init__(self, conf=0.3):

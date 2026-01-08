@@ -4,7 +4,7 @@ from geometry_msgs.msg import Twist
 from .speech import tiago_say
 from .time_utils import wait_for_valid_sim_time
 from .base_motion import publish_cmd_vel
-from .vision import simulate_face_recognition, scan_center_and_approach_person_yolo
+from .vision import recognize_person, scan_center_and_approach_person_yolo
 
 from .arm import offer_pill_with_arm, play_motion
 from .io_prompts import ask_yes_no
@@ -59,8 +59,9 @@ def run_interaction() -> None:
 
 
     # 2) Face recognition simulation
-    recognized = simulate_face_recognition(patient, face_hold_seconds, cam_index)
-    if not recognized:
+    recognized = recognize_person(hold_seconds=2.0, cam_index=0)
+
+    if recognized != "patient":
         tiago_say("No worries — we can try again later.")
         log_admin(conn, patient, "aborted_no_recognition", attempts=0, notes="user cancelled face window")
         return
