@@ -1,25 +1,134 @@
 import math
 import rospy
+import os
 from .speech import tiago_say
 from .base_motion import publish_cmd_vel
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 from tf.transformations import euler_from_quaternion
 
+try:
+    from openai import OpenAI
+    _HAS_OPENAI = True
+except Exception:
+    OpenAI = None
+    _HAS_OPENAI = False
+
+# Lazy singleton client
+_client = None
+
+
+def _get_openai_client():
+    """
+    Creates an OpenAI client if possible.
+    Needs OPENAI_API_KEY in environment (standard SDK behavior).
+    """
+    global _client
+    if not _HAS_OPENAI:
+        return None
+
+    if _client is not None:
+        return _client
+
+    # If key isn't set, just disable LLM and fall back to defaults.
+    if not os.environ.get("OPENAI_API_KEY"):
+        rospy.logwarn("OPENAI_API_KEY not set; falling back to canned lines.")
+        return None
+
+    try:
+        _client = OpenAI()
+        return _client
+    except Exception as e:
+        rospy.logwarn("Failed to init OpenAI client; falling back to canned lines. err=%s", e)
+        return None
+
+
+def _generate_short_line(kind: str, patient_name: str = "the patient") -> str:
+    """
+    kind: "joke" | "concern"
+    Returns a short 1–2 line string. Falls back to a safe default on any failure.
+    """
+    client = _get_openai_client()
+
+    fallback_joke = "Okay okay — no pressure. But that pill is smaller than my patience!"
+    fallback_concern = "Skipping it can be risky — your family and your doctor would want you protected today."
+
+    if client is None:
+        return fallback_joke if kind == "joke" else fallback_concern
+
+    if kind == "joke":
+        instructions = (
+            "You write a gentle, non-mean joke for a healthcare robot. "
+            "Goal: light humor to reduce anxiety after a medication refusal. "
+            "Constraints: 1–2 short lines, friendly, no other text or preemble or final comments, directly the text."
+        )
+        user_prompt = (
+            f"The patient ({patient_name}) just refused to take a pill. "
+            "Generate a text the robot can say."
+        )
+    else:
+        instructions = (
+            "You write a brief, empathetic persuasion line for a healthcare robot. "
+            "Goal: encourage medication adherence by referencing family concern and/or medical risk. "
+            "Constraints: 1–2 short lines, caring tone, no other text or preemble or final comments, directly the text."
+        )
+        user_prompt = (
+            f"The patient ({patient_name}) is refusing medication. "
+            "Generate a text that encourages taking it, referencing family concern and/or health importance."
+        )
+
+    try:
+        # Responses API (recommended for new projects) :contentReference[oaicite:3]{index=3}
+        resp = client.responses.create(
+            model="gpt-5-nano",
+            input=[
+                {"role": "developer", "content": instructions},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        text = (resp.output_text or "").strip()
+        if not text:
+            return fallback_joke if kind == "joke" else fallback_concern
+
+        # Keep it truly short (defensive truncation)
+        # (If the model returns more, keep only first 2 lines.)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        text = "\n".join(lines[:2]).strip()
+
+        # Final sanity fallback
+        if len(text) < 3:
+            return fallback_joke if kind == "joke" else fallback_concern
+
+        return text
+
+    except Exception as e:
+        rospy.logwarn("OpenAI call failed; falling back to canned lines. kind=%s err=%s", kind, e)
+        return fallback_joke if kind == "joke" else fallback_concern
+
+
 def humor_interaction(pub: rospy.Publisher, spin_angular_z: float) -> None:
     tiago_say("I see some hesitation... Time for a little humor!")
     rospy.sleep(1.0)
-    tiago_say("Your refusal is very hard to swallow... but not this pill! It goes down as smooth as champagne.")
+
+    # Replaces the fixed joke with an LLM-generated short joke
+    joke = _generate_short_line(kind="joke", patient_name=rospy.get_param("~patient_name", "Francesco"))
+    tiago_say(joke)
+
     tiago_say("Wheeee! Spinning for motivation!")
 
-    rotate_in_place(pub, angle_rad=2.0*math.pi, wz=spin_angular_z, odom_topic="/mobile_base_controller/odom")
+    rotate_in_place(pub, angle_rad=2.0 * math.pi, wz=spin_angular_z, odom_topic="/mobile_base_controller/odom")
 
     tiago_say("Alright Francesco — would you take it now?")
+
 
 def family_concern() -> None:
     tiago_say("Are you sure? This is VERY important.")
     rospy.sleep(2.0)
-    tiago_say("Your family will be worried if you skip it. They care about you a lot.")
+
+    # Replaces the fixed concern line with an LLM-generated short concern
+    concern = _generate_short_line(kind="concern", patient_name=rospy.get_param("~patient_name", "Francesco"))
+    tiago_say(concern)
+
     rospy.sleep(2.0)
     tiago_say("Please, take it now.")
 
