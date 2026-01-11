@@ -50,7 +50,7 @@ def _generate_short_line(kind: str, patient_name: str = "the patient") -> str:
     """
     client = _get_openai_client()
 
-    fallback_joke = "Okay okay — no pressure. But that pill is smaller than my patience!"
+    fallback_joke = "Your refusal is hard to swallow... but not this pill! It goes down as smooth as champagne."
     fallback_concern = "Skipping it can be risky — your family and your doctor would want you protected today."
 
     if client is None:
@@ -81,6 +81,9 @@ def _generate_short_line(kind: str, patient_name: str = "the patient") -> str:
         # Responses API (recommended for new projects) :contentReference[oaicite:3]{index=3}
         resp = client.responses.create(
             model="gpt-5-nano",
+            reasoning={
+                "effort": "minimal"
+            },
             input=[
                 {"role": "developer", "content": instructions},
                 {"role": "user", "content": user_prompt},
@@ -108,8 +111,6 @@ def _generate_short_line(kind: str, patient_name: str = "the patient") -> str:
 
 def humor_interaction(pub: rospy.Publisher, spin_angular_z: float) -> None:
     tiago_say("I see some hesitation... Time for a little humor!")
-    rospy.sleep(1.0)
-
     # Replaces the fixed joke with an LLM-generated short joke
     joke = _generate_short_line(kind="joke", patient_name=rospy.get_param("~patient_name", "Francesco"))
     tiago_say(joke)
@@ -123,13 +124,9 @@ def humor_interaction(pub: rospy.Publisher, spin_angular_z: float) -> None:
 
 def family_concern() -> None:
     tiago_say("Are you sure? This is VERY important.")
-    rospy.sleep(2.0)
-
     # Replaces the fixed concern line with an LLM-generated short concern
     concern = _generate_short_line(kind="concern", patient_name=rospy.get_param("~patient_name", "Francesco"))
     tiago_say(concern)
-
-    rospy.sleep(2.0)
     tiago_say("Please, take it now.")
 
 def yaw_from_odom_msg(msg: Odometry) -> float:

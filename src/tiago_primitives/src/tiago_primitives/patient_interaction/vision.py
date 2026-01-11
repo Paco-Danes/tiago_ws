@@ -109,7 +109,7 @@ def recognize_person(hold_seconds: float = 2.0, cam_index: int = 0) -> str:
             
             if elapsed >= hold_seconds:
                 final_identity = current_candidate
-                tiago_say(f"Hello, {final_identity}.")
+                #tiago_say(f"Hello, {final_identity}.")
                 break
         else:
             # Reset if face is unknown or lost
@@ -373,7 +373,10 @@ def scan_center_and_approach_person_yolo(
 
     tiago_say("Approaching.")
 
-    travel = float(approach_fraction) * float(dist0)
+    # Always stop ~1.0m away from the person for stability.
+    # (We keep `approach_fraction` in the signature for compatibility, but don't use it.)
+    stop_distance_m = 1.0
+    travel = float(dist0) - float(stop_distance_m)
     travel = max(0.0, min(travel, 4.0))
     if travel < 0.05:
         tiago_say("Already close enough.")

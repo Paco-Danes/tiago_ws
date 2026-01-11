@@ -10,6 +10,8 @@ from .arm import offer_pill_with_arm, play_motion
 from .io_prompts import ask_yes_no
 from .record import ensure_db, log_admin
 from .persuasion import humor_interaction, family_concern
+from .supervisor_dialogue import supervisor_interaction
+
 
 
 def run_interaction() -> None:
@@ -25,7 +27,7 @@ def run_interaction() -> None:
     db_path = rospy.get_param("~db_path", "/home/user/exchange/tiago_ws/data/med_records.db")
 
     cam_index = int(rospy.get_param("~cam_index", 0))
-    face_hold_seconds = float(rospy.get_param("~face_hold_seconds", 3.0))
+    face_hold_seconds = float(rospy.get_param("~face_hold_seconds", 2.0))
 
     pub = rospy.Publisher(cmd_vel_topic, Twist, queue_size=10)
     conn = ensure_db(db_path)
@@ -59,38 +61,43 @@ def run_interaction() -> None:
 
 
     # 2) Face recognition simulation
-    recognized = recognize_person(hold_seconds=2.0, cam_index=0)
+    recognized = recognize_person(hold_seconds=face_hold_seconds, cam_index=cam_index)
 
-    if recognized != "patient":
+    if recognized != "patient" and recognized != "supervisor":
         tiago_say("No worries — we can try again later.")
         log_admin(conn, patient, "aborted_no_recognition", attempts=0, notes="user cancelled face window")
         return
+    
+    if recognized == "supervisor":
+        tiago_say("Hello, supervisor. Awaiting further instructions.")
+        supervisor_interaction(conn, patient_name=patient)
 
-    # 3) Greet + offer pill
-    tiago_say(f"Oh, {patient}, I see you — you look great. Ready to take your medication?")
-    offer_pill_with_arm()
+    if recognized == "patient":
+        # 3) Greet + offer pill
+        tiago_say(f"Oh, {patient}, I see you — you look great. Ready to take your medication?")
+        offer_pill_with_arm()
 
-    # 4) Up to 3 attempts
-    attempt = 1
-    while attempt <= 3 and not rospy.is_shutdown():
-        if ask_yes_no("Pill taken?"):
-            play_motion("home", timeout_s=12.0)
-            tiago_say("Very good — motivated and disciplined.")
-            tiago_say("I added this administration to your record! See you soon.")
-            log_admin(conn, patient, "taken", attempts=attempt)
-            return
+        # 4) Up to 3 attempts
+        attempt = 1
+        while attempt <= 3 and not rospy.is_shutdown():
+            if ask_yes_no("Pill taken?"):
+                play_motion("home", timeout_s=12.0)
+                tiago_say("Very good — motivated and disciplined.")
+                tiago_say("I added this administration to your record! See you soon.")
+                log_admin(conn, patient, "taken", attempts=attempt)
+                return
 
-        if attempt == 1:
-            humor_interaction(pub, spin_angular_z)
-        elif attempt == 2:
-            family_concern()
-        else:
-            break
+            if attempt == 1:
+                humor_interaction(pub, spin_angular_z)
+            elif attempt == 2:
+                family_concern()
+            else:
+                break
 
-        attempt += 1
+            attempt += 1
 
-    # Final refusal
-    play_motion("home", timeout_s=12.0)
-    tiago_say("Okay — I will stop insisting for now.")
-    tiago_say("I will record that you refused this dose.")
-    log_admin(conn, patient, "refused", attempts=3)
+        # Final refusal
+        play_motion("home", timeout_s=12.0)
+        tiago_say("Okay — I will stop insisting for now.")
+        tiago_say("I will record that you refused this dose.")
+        log_admin(conn, patient, "refused", attempts=3)
