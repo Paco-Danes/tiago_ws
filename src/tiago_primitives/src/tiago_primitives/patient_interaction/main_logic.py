@@ -8,7 +8,7 @@ from .vision import recognize_person, scan_center_and_approach_person_yolo
 
 from .arm import offer_pill_with_arm, play_motion
 from .io_prompts import ask_yes_no
-from .record import ensure_db, log_admin
+from .record import ensure_db, log_admin, get_best_second_strategy
 from .persuasion import humor_interaction, family_concern
 from .supervisor_dialogue import supervisor_interaction
 
@@ -22,7 +22,7 @@ def run_interaction() -> None:
     patient = rospy.get_param("~patient_name", "Francesco")
     cmd_vel_topic = rospy.get_param("~cmd_vel_topic", "/mobile_base_controller/cmd_vel")
 
-    spin_angular_z = rospy.get_param("~spin_angular_z", 1.4)  # rad/s
+    spin_angular_z = rospy.get_param("~spin_angular_z", 1.5)  # rad/s
 
     db_path = rospy.get_param("~db_path", "/home/user/exchange/tiago_ws/data/med_records.db")
 
@@ -77,27 +77,33 @@ def run_interaction() -> None:
         tiago_say(f"Oh, {patient}, I see you — you look great. Ready to take your medication?")
         offer_pill_with_arm()
 
-        # 4) Up to 3 attempts
-        attempt = 1
-        while attempt <= 3 and not rospy.is_shutdown():
-            if ask_yes_no("Pill taken?"):
-                play_motion("home", timeout_s=12.0)
-                tiago_say("Very good — motivated and disciplined.")
-                tiago_say("I added this administration to your record! See you soon.")
-                log_admin(conn, patient, "taken", attempts=attempt)
-                return
+        # 4) Up to 2 attempts:
+        # Attempt 1: direct
+        if ask_yes_no("Pill taken?"):
+            play_motion("home", timeout_s=12.0)
+            tiago_say("Very good — motivated and disciplined.")
+            tiago_say("I added this administration to your record! See you soon.")
+            log_admin(conn, patient, "taken", attempts=1, second_strategy=None)
+            return
 
-            if attempt == 1:
-                humor_interaction(pub, spin_angular_z)
-            elif attempt == 2:
-                family_concern()
-            else:
-                break
+        # Attempt 2: choose strategy based on patient-specific success rate
+        second = get_best_second_strategy(conn, patient)
+        rospy.loginfo("Second-attempt strategy chosen for %s: %s", patient, second)
 
-            attempt += 1
+        if second == "joke":
+            humor_interaction(pub, spin_angular_z)
+        else:
+            family_concern()
 
-        # Final refusal
+        if ask_yes_no("Pill taken?"):
+            play_motion("home", timeout_s=12.0)
+            tiago_say("Very good — thank you.")
+            tiago_say("I added this administration to your record! See you soon.")
+            log_admin(conn, patient, "taken", attempts=2, second_strategy=second)
+            return
+
+        # Final refusal after 2 attempts
         play_motion("home", timeout_s=12.0)
         tiago_say("Okay — I will stop insisting for now.")
         tiago_say("I will record that you refused this dose.")
-        log_admin(conn, patient, "refused", attempts=3)
+        log_admin(conn, patient, "refused", attempts=2, second_strategy=second)
